@@ -7,4 +7,4 @@ WARNING
 - 3o fps camera or more
 - buy me a cup of coffee
 
-  ![Arduino Image](BPMchartjpg)
+  ![Arduino Image](BPMchart.jpg)
