@@ -1,0 +1,386 @@
+"""
+OpenCV Pulse Detector (remote photoplethysmography, POS algorithm)
+Keys:     q / ESC = quit,  f = toggle fullscreen,  g = show/hide face guide
+
+face the camera, steady even lighting (no flicker), hold still for
+~10 seconds. 
+"""
+
+import argparse
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+
+try:
+    import mediapipe as mp
+    FaceMesh = mp.solutions.face_mesh.FaceMesh
+except (ImportError, AttributeError):
+    raise SystemExit(
+        "This script needs MediaPipe's classic Face Mesh API. Install with:\n"
+        '  pip install "mediapipe==0.10.21"   (Python 3.9-3.12)')
+
+WIN = "Pulse Detector"
+BUFFER_SEC = 12      # seconds of signal kept for analysis
+MIN_SEC = 6          # seconds needed before first estimate
+LOW_HZ, HIGH_HZ = 0.75, 3.0   # 45 - 180 BPM
+TARGET_FS = 30       # resampling rate (Hz)
+MIN_CONF = 0.45      # minimum spectral peak confidence to accept an estimate
+DETECT_WIDTH = 640   # face mesh runs on a downscaled copy for speed
+LOW_BPM_ALERT = 60   # panel turns red below this BPM
+HIGH_BPM_ALERT = 100 # panel turns red at or above this BPM
+MOTION_THRESH = 0.03 # skip frames where the nose moves > 3% of face width
+GUIDE_AXES = (0.30, 0.40)   # face-guide oval half-width / half-height, as a fraction of frame height
+GUIDE_ALPHA = 0.45          # guide opacity (semi-transparent)
+
+POS_WINDOW_SEC = 1.6   # sliding window length from the POS paper
+_POS_PROJ = np.array([[0.0, 1.0, -1.0],
+                      [-2.0, 1.0, 1.0]])
+
+# Face Mesh landmark groups (convex hulls), each shrunk/grown about its center.
+# (landmark indices, (x scale, y scale))
+FOREHEAD_IDX = [10, 109, 67, 103, 338, 297, 332, 108, 337, 151, 107, 336, 9]
+LCHEEK_IDX = [116, 117, 118, 119, 100, 36, 205, 187, 123, 50]
+RCHEEK_IDX = [345, 346, 347, 348, 329, 266, 425, 411, 352, 280]
+ROI_DEFS = [
+    (FOREHEAD_IDX, (0.9, 0.9)),   # keep clear of hairline and eyebrows
+    (LCHEEK_IDX, (1.3, 1.3)),
+    (RCHEEK_IDX, (1.3, 1.3)),
+]
+NOSE_TIP, FACE_LEFT, FACE_RIGHT = 1, 234, 454
+
+
+# ----------------------------------------------------------------- signal ---
+def pos_signal(rgb, fs):
+    """
+    POS (Plane-Orthogonal-to-Skin, Wang et al. 2017).
+    rgb: (N, 3) mean R, G, B per frame, uniformly sampled at fs Hz.
+    Returns a 1-D pulse signal of length N.
+    """
+    n = len(rgb)
+    win = int(round(POS_WINDOW_SEC * fs))
+    h_out = np.zeros(n)
+    for end in range(win, n + 1):
+        c = rgb[end - win:end].T                          # 3 x win
+        cn = c / (c.mean(axis=1, keepdims=True) + 1e-9)   # temporal normalization
+        s = _POS_PROJ @ cn                                # 2 x win projection
+        h = s[0] + (s[0].std() / (s[1].std() + 1e-9)) * s[1]   # alpha tuning
+        h_out[end - win:end] += h - h.mean()              # overlap-add
+    return h_out
+
+
+def analyze(times, values):
+    """Return (bpm, confidence, filtered_signal) from per-frame mean RGB."""
+    t = np.asarray(times, dtype=np.float64)
+    rgb = np.asarray(values, dtype=np.float64)            # (N, 3), RGB order
+    t -= t[0]
+
+    # resample each channel to a uniform rate (webcam frame timing is jittery)
+    tu = np.arange(0, t[-1], 1.0 / TARGET_FS)
+    rgb_u = np.stack([np.interp(tu, t, rgb[:, k]) for k in range(3)], axis=1)
+
+    # POS projection -> motion/lighting-robust pulse signal
+    vu = pos_signal(rgb_u, TARGET_FS)
+    vu = vu - np.polyval(np.polyfit(tu, vu, 1), tu)
+    vu = vu / (vu.std() + 1e-9)
+
+    # band-pass filter through the FFT (display signal)
+    n = len(vu)
+    freqs = np.fft.rfftfreq(n, 1.0 / TARGET_FS)
+    mask = (freqs >= LOW_HZ) & (freqs <= HIGH_HZ)
+    filtered = np.fft.irfft(np.fft.rfft(vu) * mask, n)
+
+    # spectrum with Hann window + zero padding for a finer frequency grid
+    nfft = 8192
+    spec = np.abs(np.fft.rfft(vu * np.hanning(n), nfft)) ** 2
+    f = np.fft.rfftfreq(nfft, 1.0 / TARGET_FS)
+    band = (f >= LOW_HZ) & (f <= HIGH_HZ)
+    if not band.any() or spec[band].sum() <= 0:
+        return None, 0.0, filtered
+
+    fb, sb = f[band], spec[band]
+    peak = fb[np.argmax(sb)]
+    near = (fb > peak - 0.1) & (fb < peak + 0.1)
+    conf = sb[near].sum() / sb.sum()
+    return peak * 60.0, float(conf), filtered
+
+
+# ------------------------------------------------------------- skin regions ---
+def landmark_points(landmarks, W, H):
+    """All 468 landmarks as an (468, 2) array in full-frame pixel coordinates."""
+    return np.array([(p.x, p.y) for p in landmarks]) * np.array([W, H])
+
+
+def skin_polygons(pts):
+    """Forehead + both cheeks as int32 polygons built from landmark hulls."""
+    polys = []
+    for idx, (sx, sy) in ROI_DEFS:
+        hull = cv2.convexHull(pts[idx].astype(np.float32)).reshape(-1, 2)
+        c = hull.mean(axis=0)
+        polys.append((c + (hull - c) * np.array([sx, sy])).astype(np.int32))
+    return polys
+
+
+def pooled_rgb(frame, polys):
+    """Mean RGB over all pixels inside the polygons (area-weighted)."""
+    H, W = frame.shape[:2]
+    total = np.zeros(3)
+    count = 0
+    for poly in polys:
+        x, y, w, h = cv2.boundingRect(poly)
+        x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, W), min(y + h, H)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            continue
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillPoly(mask, [(poly - np.array([x0, y0])).astype(np.int32)], 255)
+        n = cv2.countNonZero(mask)
+        if n < 20:
+            continue
+        mean = cv2.mean(frame[y0:y1, x0:x1], mask)[:3]
+        total += np.array(mean) * n
+        count += n
+    return (total / count)[::-1] if count else None   # BGR -> RGB
+
+
+# ---------------------------------------------------------------- drawing ---
+def beat_envelope(phase):
+    """Lub-dub shape: sharp beat at phase 0, softer second beat at ~0.28."""
+    return np.exp(-(phase / 0.07) ** 2) + 0.6 * np.exp(-((phase - 0.28) / 0.07) ** 2)
+
+
+def heart_polygon(cx, cy, scale):
+    t = np.linspace(0, 2 * np.pi, 120)
+    x = 16 * np.sin(t) ** 3
+    y = 13 * np.cos(t) - 5 * np.cos(2 * t) - 2 * np.cos(3 * t) - np.cos(4 * t)
+    return np.stack([cx + x * scale, cy - y * scale], axis=1).astype(np.int32)
+
+
+def guide_geometry(W, H):
+    """Center and half-axes (cx, cy, a, b) of the face-guide oval."""
+    return W // 2, H // 2, int(GUIDE_AXES[0] * H), int(GUIDE_AXES[1] * H)
+
+
+def face_aligned(pts, geom):
+    """True when the face is roughly centered in the oval and about the right size."""
+    cx, cy, a, b = geom
+    fx = (pts[FACE_LEFT][0] + pts[FACE_RIGHT][0]) / 2
+    fy = (pts[10][1] + pts[152][1]) / 2           # forehead top .. chin
+    face_h = abs(pts[152][1] - pts[10][1])
+    return (abs(fx - cx) < 0.3 * a and abs(fy - cy) < 0.2 * b
+            and 0.75 <= face_h / (2 * b) <= 1.15)
+
+
+def draw_face_guide(frame, aligned):
+    """Semi-transparent oval outline; white normally, green once the face fits."""
+    H, W = frame.shape[:2]
+    cx, cy, a, b = guide_geometry(W, H)
+    t = max(2, H // 180)
+    color = (90, 255, 160) if aligned else (255, 255, 255)   # BGR
+    x0, y0 = max(cx - a - t - 2, 0), max(cy - b - t - 2, 0)
+    x1, y1 = min(cx + a + t + 2, W), min(cy + b + t + 2, H)
+    roi = frame[y0:y1, x0:x1]
+    ov = roi.copy()
+    cv2.ellipse(ov, (cx - x0, cy - y0), (a, b), 0, 0, 360, color, t, cv2.LINE_AA)
+    roi[:] = cv2.addWeighted(ov, GUIDE_ALPHA, roi, 1 - GUIDE_ALPHA, 0)
+    if not aligned:
+        msg = "Place your face inside the oval"
+        fs = max(0.6, H / 900)
+        (tw, _), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+        org = (cx - tw // 2, min(cy + b + int(40 * fs), H - 10))
+        cv2.putText(frame, msg, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, msg, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_panel(frame, bpm, phase, wave, status):
+    """Render the heart panel at base size, scale it to the frame, blend top-right."""
+    H, W = frame.shape[:2]
+    pw, ph = 270, 210
+    alert = None
+    if bpm:
+        if bpm >= HIGH_BPM_ALERT:
+            alert = "HIGH"
+        elif bpm < LOW_BPM_ALERT:
+            alert = "LOW"
+    bg = (20, 20, 120) if alert else (28, 20, 20)          # BGR: red when alert
+    border = (90, 90, 255) if alert else (90, 70, 70)
+    p = np.full((ph, pw, 3), bg, np.uint8)
+    cv2.rectangle(p, (0, 0), (pw - 1, ph - 1), border, 3 if alert else 1)
+
+    # animated heart with glow
+    env = float(beat_envelope(phase)) if bpm else 0.0
+    scale = 2.0 * (1.0 + 0.22 * env)
+    poly = heart_polygon(70, 72, scale)
+    glow = np.zeros_like(p)
+    cv2.fillPoly(glow, [poly], (60, 60, 255))
+    glow = cv2.GaussianBlur(glow, (41, 41), 0)
+    p = cv2.add(p, cv2.convertScaleAbs(glow, alpha=0.4 + 0.9 * min(env, 1.0)))
+    if alert:
+        color = (235, 235, 255)   # light heart so it stands out on the red panel
+    else:
+        color = (70, 70, 255) if bpm else (110, 110, 120)
+    cv2.fillPoly(p, [poly], color, cv2.LINE_AA)
+    cv2.polylines(p, [poly], True, (200, 200, 255), 1, cv2.LINE_AA)
+
+    # BPM readout
+    if bpm:
+        cv2.putText(p, f"{bpm:.0f}", (130, 82), cv2.FONT_HERSHEY_DUPLEX, 1.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(p, "BPM", (135, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (180, 180, 255), 1, cv2.LINE_AA)
+        if alert:
+            cv2.putText(p, alert, (190, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(p, "--", (130, 82), cv2.FONT_HERSHEY_DUPLEX, 1.7,
+                    (150, 150, 160), 2, cv2.LINE_AA)
+    cv2.putText(p, status, (10, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (190, 190, 200), 1, cv2.LINE_AA)
+
+    # scrolling pulse waveform (last ~6 s)
+    if wave is not None and len(wave) > 10:
+        w = wave[-TARGET_FS * 6:]
+        w = w / (np.abs(w).max() + 1e-9)
+        xs = np.linspace(10, pw - 10, len(w))
+        ys = 175 - w * 28
+        pts = np.stack([xs, ys], axis=1).astype(np.int32)
+        cv2.polylines(p, [pts], False, (90, 255, 160), 2, cv2.LINE_AA)
+    cv2.line(p, (10, 175), (pw - 10, 175), (70, 70, 80), 1)
+
+    # scale with the frame so it stays proportionate in a bigger window
+    s = max(1.0, W / 960.0)
+    if s > 1.0:
+        p = cv2.resize(p, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+    h2, w2 = p.shape[:2]
+    x0, y0 = W - w2 - 12, 12
+    if x0 < 0 or y0 + h2 > H:
+        return
+    roi = frame[y0:y0 + h2, x0:x0 + w2]
+    roi[:] = cv2.addWeighted(roi, 0.2, p, 0.8, 0)
+
+
+# ------------------------------------------------------------------- main ---
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--width", type=int, default=1280)
+    ap.add_argument("--height", type=int, default=720)
+    args = ap.parse_args()
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise SystemExit("Could not open camera.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    mesh = FaceMesh(static_image_mode=False, max_num_faces=1,
+                    refine_landmarks=False,
+                    min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    sized, fullscreen, show_guide = False, False, True
+
+    times, vals = deque(), deque()
+    lost = 0
+    prev_nose = None
+    bpm_smooth, conf, wave = None, 0.0, None
+    phase, last = 0.0, time.perf_counter()
+    i = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.flip(frame, 1)
+        H, W = frame.shape[:2]
+        if not sized:   # open the window at least 1280 px wide
+            dw = max(W, 1280)
+            cv2.resizeWindow(WIN, dw, int(dw * H / W))
+            sized = True
+
+        now = time.perf_counter()
+        dt, last = now - last, now
+
+        # --- face mesh on a downscaled copy (landmarks are normalized)
+        k = min(1.0, DETECT_WIDTH / W)
+        small = cv2.resize(frame, None, fx=k, fy=k) if k < 1.0 else frame
+        res = mesh.process(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+
+        status = "Looking for face..."
+        polys = []
+        aligned = False
+        if res.multi_face_landmarks:
+            lost = 0
+            pts = landmark_points(res.multi_face_landmarks[0].landmark, W, H)
+            polys = skin_polygons(pts)
+            aligned = face_aligned(pts, guide_geometry(W, H))
+
+            # skip frames with big head movement (motion corrupts the signal)
+            face_w = np.linalg.norm(pts[FACE_RIGHT] - pts[FACE_LEFT]) + 1e-9
+            moving = (prev_nose is not None and
+                      np.linalg.norm(pts[NOSE_TIP] - prev_nose) / face_w > MOTION_THRESH)
+            prev_nose = pts[NOSE_TIP].copy()
+
+            sample = None if moving else pooled_rgb(frame, polys)  # sample BEFORE drawing
+            if moving:
+                status = "Moving - hold still"
+            elif sample is not None:
+                times.append(now)
+                vals.append(sample)
+                while times and now - times[0] > BUFFER_SEC:
+                    times.popleft()
+                    vals.popleft()
+
+            if times:
+                span = times[-1] - times[0]
+                if not moving:
+                    if span < MIN_SEC:
+                        status = f"Hold still... {span:.0f}/{MIN_SEC}s"
+                    else:
+                        status = "Measuring"
+                        if i % 5 == 0:
+                            est, conf, wave = analyze(times, vals)
+                            if est is not None and conf >= MIN_CONF:
+                                bpm_smooth = est if bpm_smooth is None else 0.9 * bpm_smooth + 0.1 * est
+                        if conf < MIN_CONF:
+                            status = "Weak signal - hold still, even light"
+        else:
+            lost += 1
+            prev_nose = None
+            if lost > 30:   # face gone for a while: restart measurement
+                bpm_smooth, wave = None, None
+                times.clear()
+                vals.clear()
+
+        for poly in polys:
+            cv2.polylines(frame, [poly], True, (90, 255, 160), 2, cv2.LINE_AA)
+
+        if show_guide:
+            draw_face_guide(frame, aligned)
+
+        # --- advance the heart animation at the measured rate
+        if bpm_smooth:
+            phase = (phase + dt * bpm_smooth / 60.0) % 1.0
+
+        draw_panel(frame, bpm_smooth, phase, wave, status)
+        cv2.imshow(WIN, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            break
+        if key == ord("g"):
+            show_guide = not show_guide
+        if key == ord("f"):
+            fullscreen = not fullscreen
+            cv2.setWindowProperty(
+                WIN, cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        i += 1
+
+    mesh.close()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
