@@ -14,3 +14,6 @@ WARNING
 Works!
 ==========
 ![Test](Test.png)
+
+Based on: "GRGB rPPG: An Efficient Low-Complexity Remote Photoplethysmography-Based Algorithm for Heart Rate Estimation"
+: https://pmc.ncbi.nlm.nih.gov/articles/PMC9952130/ 
